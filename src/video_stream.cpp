@@ -112,7 +112,7 @@ virtual void do_capture() {
     int frame_counter = 0;
     // Read frames as fast as possible
     capture_thread_running = true;
-    while (nh->ok() && capture_thread_running && subscriber_num > 0) {
+    while (nh->ok() && capture_thread_running) {
         {
           std::lock_guard<std::mutex> lock(c_mutex);
           latest_config = config;
@@ -264,6 +264,7 @@ virtual void subscribe() {
       }
     if (!cap->isOpened()) {
       NODELET_FATAL_STREAM("Invalid 'video_stream_provider': " << video_stream_provider);
+      ros::shutdown();
       return;
     }
   }
@@ -285,6 +286,7 @@ virtual void subscribe() {
   cap->set(cv::CAP_PROP_FPS, latest_config.set_camera_fps);
   if(!cap->isOpened()){
     NODELET_ERROR_STREAM("Could not open the stream.");
+    ros::shutdown();
     return;
   }
   if (latest_config.width != 0 && latest_config.height != 0){
