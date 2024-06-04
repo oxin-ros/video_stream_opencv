@@ -1,6 +1,6 @@
-cmake_minimum_required(VERSION 2.8.3)
+cmake_minimum_required(VERSION 3.10.2)
 project(video_stream_opencv)
-add_definitions(-std=c++11)
+add_definitions(-std=c++17)
 
 find_package(catkin REQUIRED COMPONENTS
   roscpp
@@ -13,7 +13,7 @@ find_package(catkin REQUIRED COMPONENTS
   dynamic_reconfigure)
 
 
-find_package(OpenCV)
+find_package(OpenCV REQUIRED)
 
 generate_dynamic_reconfigure_options(
   cfg/VideoStream.cfg)

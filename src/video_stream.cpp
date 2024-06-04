@@ -41,6 +41,7 @@
 #include <camera_info_manager/camera_info_manager.h>
 #include <opencv2/highgui/highgui.hpp>
 #include <opencv2/imgproc/imgproc.hpp>
+#include <opencv2/videoio/registry.hpp>
 #include <cv_bridge/cv_bridge.h>
 #include <sstream>
 #include <stdexcept>
@@ -72,6 +73,32 @@ bool capture_thread_running;
 boost::thread capture_thread;
 ros::Timer publish_timer;
 sensor_msgs::CameraInfo cam_info_msg;
+std::string backend;
+std::map<std::string, int> backend_map;
+
+void initalize_backend_map()
+{
+  backend_map["ANY"] = 0;
+  auto backends = cv::videoio_registry::getBackends();
+  for(auto backend : backends)
+  {
+    NODELET_INFO_STREAM("Found: "<<cv::videoio_registry::getBackendName(backend)<<" backend for OpenCV.");
+    backend_map[cv::videoio_registry::getBackendName(backend)] = backend;
+  }
+}
+
+int get_backend()
+{
+  auto it = backend_map.find(backend);
+  if (it == backend_map.end())
+  {
+    NODELET_WARN_STREAM("Backend not registered in map. Reverting to ANY (first available).");
+    return 0;
+  }
+
+  NODELET_INFO_STREAM("Selecting "<<it->first<<" as backend for OPENCV.");
+  return it->second;
+}
 
 // Based on the ros tutorial on transforming opencv images to Image messages
 
@@ -107,7 +134,13 @@ virtual void do_capture() {
     NODELET_DEBUG("Capture thread started");
     cv::Mat frame;
     VideoStreamConfig latest_config = config;
-    ros::Rate camera_fps_rate(latest_config.set_camera_fps);
+
+    // set true fps because skip some frames
+    size_t skip = 0;
+    const size_t skip_interval = 2;
+    const auto fps = latest_config.fps / (skip_interval + 1);
+
+    ros::Rate camera_fps_rate(fps);
 
     int frame_counter = 0;
     // Read frames as fast as possible
@@ -119,7 +152,7 @@ virtual void do_capture() {
         }
         if (!cap->isOpened()) {
           NODELET_WARN("Waiting for device...");
-          cv::waitKey(100);
+          cv::waitKey(10);
           continue;
         }
         if (!cap->read(frame)) {
@@ -127,7 +160,13 @@ virtual void do_capture() {
           if (latest_config.reopen_on_read_failure) {
             NODELET_WARN_STREAM_THROTTLE(1.0, "trying to reopen the device");
             unsubscribe();
-            subscribe();
+            while(!cap || !cap->isOpened())
+            {
+              subscribe(false);
+              if(!cap || !cap->isOpened()) {
+                boost::this_thread::yield();
+              }
+            }
           }
         }
 
@@ -136,13 +175,22 @@ virtual void do_capture() {
         {
             camera_fps_rate.sleep();
         }
+        else
+        {
+            // need skip
+            if (skip < skip_interval) {
+                skip++;
+                continue;
+            }
+            skip = 0;
+        }
         NODELET_DEBUG_STREAM("Current frame_counter: " << frame_counter << " latest_config.stop_frame - latest_config.start_frame: " << latest_config.stop_frame - latest_config.start_frame);
         if (video_stream_provider_type == "videofile" &&
             frame_counter >= latest_config.stop_frame - latest_config.start_frame)
         {
             if (latest_config.loop_videofile)
             {
-                cap->open(video_stream_provider);
+                cap->open(video_stream_provider, get_backend());
                 cap->set(cv::CAP_PROP_POS_FRAMES, latest_config.start_frame);
                 frame_counter = 0;
                 NODELET_DEBUG("Reached end of frames, looping.");
@@ -220,7 +268,7 @@ virtual void do_publish(const ros::TimerEvent& event) {
     }
 }
 
-virtual void subscribe() {
+virtual void subscribe(bool launch_thread = true) {
   ROS_DEBUG("Subscribe");
   VideoStreamConfig& latest_config = config;
   // initialize camera info publisher
@@ -235,10 +283,15 @@ virtual void subscribe() {
   try {
     int device_num = std::stoi(video_stream_provider);
     NODELET_INFO_STREAM("Opening VideoCapture with provider: /dev/video" << device_num);
-    cap->open(device_num);
+    cap->open(device_num, get_backend());
   } catch (std::invalid_argument &ex) {
     NODELET_INFO_STREAM("Opening VideoCapture with provider: " << video_stream_provider);
-    cap->open(video_stream_provider);
+    if(!cap->open(video_stream_provider, get_backend()))
+    {
+      NODELET_ERROR_STREAM("Could not open the stream.");
+      ros::shutdown();
+      return;
+    }
     if(video_stream_provider_type == "videofile" )
       {
         // We can only check the number of frames when we actually open the video file
@@ -294,10 +347,10 @@ virtual void subscribe() {
     cap->set(cv::CAP_PROP_FRAME_HEIGHT, latest_config.height);
   }
 
-  cap->set(cv::CAP_PROP_BRIGHTNESS, latest_config.brightness);
-  cap->set(cv::CAP_PROP_CONTRAST, latest_config.contrast);
-  cap->set(cv::CAP_PROP_HUE, latest_config.hue);
-  cap->set(cv::CAP_PROP_SATURATION, latest_config.saturation);
+  // cap->set(cv::CAP_PROP_BRIGHTNESS, latest_config.brightness);
+  // cap->set(cv::CAP_PROP_CONTRAST, latest_config.contrast);
+  // cap->set(cv::CAP_PROP_HUE, latest_config.hue);
+  // cap->set(cv::CAP_PROP_SATURATION, latest_config.saturation);
 
   if (latest_config.auto_exposure) {
     cap->set(cv::CAP_PROP_AUTO_EXPOSURE, 0.75);
@@ -307,21 +360,26 @@ virtual void subscribe() {
     cap->set(cv::CAP_PROP_EXPOSURE, latest_config.exposure);
   }
 
-  try {
-    capture_thread = boost::thread(
-      boost::bind(&VideoStreamNodelet::do_capture, this));
-    publish_timer = nh->createTimer(
-      ros::Duration(1.0 / latest_config.fps), &VideoStreamNodelet::do_publish, this);
-  } catch (std::exception& e) {
-    NODELET_ERROR_STREAM("Failed to start capture thread: " << e.what());
+  if(launch_thread) {
+    try {
+      capture_thread = boost::thread(
+        boost::bind(&VideoStreamNodelet::do_capture, this));
+      publish_timer = nh->createTimer(
+        ros::Duration(1.0 / latest_config.fps), &VideoStreamNodelet::do_publish, this);
+    } catch (std::exception& e) {
+      NODELET_ERROR_STREAM("Failed to start capture thread: " << e.what());
+    }
   }
 }
 
 virtual void unsubscribe() {
   ROS_DEBUG("Unsubscribe");
-  publish_timer.stop();
-  capture_thread_running = false;
-  capture_thread.join();
+  if(capture_thread.get_id() != boost::this_thread::get_id())
+  {
+    publish_timer.stop();
+    capture_thread_running = false;
+    capture_thread.join();
+  }
   cap.reset();
 }
 
@@ -391,6 +449,8 @@ virtual void configCallback(VideoStreamConfig& new_config, uint32_t level) {
   NODELET_INFO_STREAM("Flip vertical image is: " << ((new_config.flip_vertical)?"true":"false"));
   NODELET_INFO_STREAM("Video start frame is: " << new_config.start_frame);
   NODELET_INFO_STREAM("Video stop frame is: " << new_config.stop_frame);
+  NODELET_INFO_STREAM("Reopen on read failure is: " << new_config.reopen_on_read_failure);
+  NODELET_INFO_STREAM("Backend is: " << new_config.backend);
 
   if (new_config.width != 0 && new_config.height != 0)
   {
@@ -418,6 +478,10 @@ virtual void onInit() {
 
     // provider can be an url (e.g.: rtsp://10.0.0.1:554) or a number of device, (e.g.: 0 would be /dev/video0)
     pnh->param<std::string>("video_stream_provider", video_stream_provider, "0");
+    pnh->param<bool>("enable_mjpg", config.enable_mjpg, true);
+    pnh->param<std::string>("backend", backend, "ANY");
+    initalize_backend_map();
+
     // check file type
     try {
       int device_num = std::stoi(video_stream_provider);
@@ -428,6 +492,9 @@ virtual void onInit() {
         video_stream_provider_type = "http_stream";
       }
       else if(video_stream_provider.find("rtsp://") != std::string::npos){
+        video_stream_provider_type = "rtsp_stream";
+      }
+      else if(video_stream_provider.find("rtspsrc") != std::string::npos){
         video_stream_provider_type = "rtsp_stream";
       }
       else{
